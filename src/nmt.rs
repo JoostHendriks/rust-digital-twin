@@ -1,29 +1,7 @@
 use canopen_tokio::nmt::{NmtCommand, NmtState};
 use can_socket::{CanFrame, CanId};
 
-pub fn process_nmt_command(node_id: u8, current_nmt_state: NmtState, data: &[u8]) -> Result<NmtState, String> {
-
-    // Check if the data the correct size
-    if data.len() != 2 {
-        return Err(format!("Received incorrect frame data length for NMT state change"));
-    }
-
-    // Extract data
-    let requested_state = data[0];
-    let addressed_node = data[1];
-
-    if addressed_node == node_id {
-        match new_nmt_state(requested_state) {
-            Ok(new_nmt_state) => Ok(new_nmt_state),
-            Err(e) => return Err(format!("Changing nmt state failed, with error: {e}"))
-        }
-    } else {
-        Ok(current_nmt_state)
-    }
-
-}
-
-fn new_nmt_state(requested_state: u8) -> Result<NmtState, String> {
+pub fn new_nmt_state(requested_state: u8) -> Result<NmtState, String> {
 
     // Label NMT command based on requested state
     let nmt_command = match requested_state {

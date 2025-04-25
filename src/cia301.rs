@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-
+use std::sync::Arc;
+use tokio::task;
+use tokio::sync::Mutex as TokioMutex;
 use can_socket::{tokio::CanSocket, CanId};
 use can_socket::CanFrame;
 use canopen_tokio::nmt::NmtState;
@@ -12,13 +14,13 @@ pub struct Node {
     pub id: u8,
     pub eds_data: EDSData,
     pub nmt_state: NmtState,
-    pub socket: CanSocket,
+    pub socket: Arc<TokioMutex<CanSocket>>,
 }
 
 impl Node {
 
-    pub fn new(
-        socket: CanSocket,
+    pub async fn new(
+        socket: Arc<TokioMutex<CanSocket>>,
         node_id: u8,
         eds_data: EDSData,
     ) -> Self {
@@ -31,70 +33,69 @@ impl Node {
         node
     }
 
-    pub async fn socket_listener(&mut self) {
+    // async fn handle_frame(&mut self, frame: &CanFrame) {
 
-        // Check if a frame is received
-        if let Some(frame) = self.socket.recv().await.ok() {
-            self.handle_frame(frame).await;
-        }
+    //     // Extract id and cob_id
+    //     let cob_id = frame.id().as_u32();
+    //     let node_id = (cob_id & 0x7F) as u8;
+    //     let function_code = frame.id().as_u32() & (0x0F << 7);
 
-    }
+    //     // Parse frame
+    //     if node_id == 0 {
 
-    async fn handle_frame(&mut self, frame: CanFrame) {
+    //         match function_code {
+    //             0x000 => self.parse_nmt_command(&frame.data()).await,
+    //             0x080 => self.parse_sync().await,
+    //             _ => {},
+    //         }
 
-        // Extract id and cob_id
-        let cob_id = frame.id().as_u32();
-        let node_id = (cob_id & 0x7F) as u8;
-        let function_code = frame.id().as_u32() & (0x0F << 7);
+    //     } else if node_id == self.id {
 
-        // Parse frame
-        if node_id == 0 {
-
-            match function_code {
-                0x000 => self.parse_nmt_command(&frame.data()).await,
-                0x080 => self.parse_sync().await,
-                _ => {},
-            }
-
-        } else if node_id == self.id {
-
-            match function_code {
-                0x080 => self.parse_emcy().await,
-                0x200 => self.parse_rpdo(&1, &frame.data()).await,
-                0x300 => self.parse_rpdo(&2, &frame.data()).await,
-                0x400 => self.parse_rpdo(&3, &frame.data()).await,
-                0x500 => self.parse_rpdo(&4, &frame.data()).await,
-                0x600 => self.parse_sdo_client_request(&frame.data()).await,
-                _ => {},
-            }
+    //         match function_code {
+    //             0x080 => self.parse_emcy().await,
+    //             0x200 => self.parse_rpdo(&1, &frame.data()).await,
+    //             0x300 => self.parse_rpdo(&2, &frame.data()).await,
+    //             0x400 => self.parse_rpdo(&3, &frame.data()).await,
+    //             0x500 => self.parse_rpdo(&4, &frame.data()).await,
+    //             0x600 => self.parse_sdo_client_request(&frame.data()).await,
+    //             _ => {},
+    //         }
             
+    //     }
+
+    // }
+
+    async fn parse_nmt_command(&mut self, data: &[u8]) -> bool {
+
+        // Check if the data the correct size
+        if data.len() != 2 {
+            log::error!("Received incorrect frame data length for NMT state change");
         }
 
-    }
+        let requested_state = data[0];
+        let addressed_node = data[1];
 
-    async fn parse_nmt_command(&mut self, data: &[u8]) {
-
-        match nmt::process_nmt_command(self.id, self.nmt_state, data) {
-            Ok(new_nmt_state) => {
-                if new_nmt_state != self.nmt_state || new_nmt_state == NmtState::Initializing {
+        if addressed_node == self.id {
+            match nmt::new_nmt_state(requested_state) {
+                Ok(new_nmt_state) => {
                     self.nmt_state = new_nmt_state;
                     let frame = nmt::create_nmt_frame(self.id, self.nmt_state);
-                    if let Err(err) = self.socket.send(&frame).await {
+                    if let Err(err) = self.socket.lock().await.send(&frame).await {
                         log::error!("Failed to send NMT frame: {err}");
                     }
+                    return true
                 }
-            }
-            Err(err) => {
-                log::error!("Failed to process NMT command: {err}");
+                Err(e) => log::error!("Changing nmt state failed, with error: {e}"),
             }
         }
+        false
     }
 
     async fn parse_sdo_client_request(&mut self, data: &[u8]) {
 
         match sdo::sdo_response(self.id, &mut self.eds_data, data) {
             Ok(frame) => {
-                if let Err(err) = self.socket.send(&frame).await {
+                if let Err(err) = self.socket.lock().await.send(&frame).await {
                     log::error!("Failed to send sdo frame: {err}");
                 }
             }
@@ -268,7 +269,7 @@ impl Node {
         let functions_code = u16::from_str_radix(&format!("{:X}80", tpdo_number + 1), 16).unwrap();
         let cob_id = CanId::new_base(functions_code | self.id as u16).unwrap();
     
-        if let Err(_) = self.socket.send(&CanFrame::new(cob_id, &data_to_send, None).unwrap()).await {
+        if let Err(_) = self.socket.lock().await.send(&CanFrame::new(cob_id, &data_to_send, None).unwrap()).await {
             log::error!("Error sending frame");
         }
     }
@@ -300,6 +301,97 @@ impl Node {
 
     }
 
+}
+
+pub async fn consume_read_queue(node_clone: Arc<TokioMutex<Node>>, queue_clone: Arc<TokioMutex<Vec<CanFrame>>>) {
+    task::spawn(async move {
+        loop {
+            let mut queue = queue_clone.lock().await;
+            let mut i = 0;
+            while i < queue.len() {
+                let frame = &queue[i];
+                let cob_id = frame.id().as_u32();
+                let function_code = cob_id & !0x7F;
+                let id = (cob_id & 0x7F) as u8;
+                let mut node = node_clone.lock().await;
+                let node_id = node.id;
+
+                if id == node_id {
+                    match function_code {
+                        // TPDO frames
+                        0x180 | 0x280 | 0x380 | 0x480 => {
+                            queue.remove(i);
+                            continue;
+                        }
+                        // RPDO frames
+                        0x200 => {
+                            node.parse_rpdo(&1, &frame.data()).await;
+                            queue.remove(i);
+                            continue;
+                        }
+                        0x300 => {
+                            node.parse_rpdo(&2, &frame.data()).await;
+                            queue.remove(i);
+                            continue;
+                        }
+                        0x400 => {
+                            node.parse_rpdo(&3, &frame.data()).await;
+                            queue.remove(i);
+                            continue;
+                        }
+                        0x500 => {
+                            node.parse_rpdo(&4, &frame.data()).await;
+                            queue.remove(i);
+                            continue;
+                        }
+                        // SDO frames
+                        0x580 => {
+                            queue.remove(i);
+                            continue;
+                        }
+                        0x600 => {
+                            node.parse_sdo_client_request(&frame.data()).await;
+                            queue.remove(i);
+                            continue;
+                        }
+                        // Heartbeat
+                        0x700 => {
+                            queue.remove(i);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match function_code {
+                        // NMT control
+                        0x000 => {
+                            match node.parse_nmt_command(&frame.data()).await {
+                                true => {
+                                    queue.remove(i);
+                                    continue;
+                                }
+                                false => break,
+                            }
+                        }
+                        // Sync
+                        0x080 => {
+                            node.parse_sync().await;
+                            queue.remove(i);
+                            continue;
+                        }
+                        _ => {},
+                    }
+                }
+                i += 1; // Only increment if nothing was removed
+            }
+
+            // if !queue.is_empty() {
+            //     for frame in queue.iter() {
+            //         println!("{:?}", frame.id());
+            //     }
+            // }
+        }
+    });
 }
 
 fn drop_front(slice: &[u8], count: usize) -> &[u8] {

@@ -1,11 +1,12 @@
-use can_socket::tokio::CanSocket;
 use cia402_runner::MotorController;
 use std::path::PathBuf;
 use tokio::task;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 use futures::future;
+use std::time::{Instant, Duration};
 
+mod canbus;
 mod eds;
 mod config;
 mod cia301;
@@ -13,8 +14,8 @@ mod nmt;
 mod sdo;
 mod cia402_runner;
 
-use crate::cia301::Node;
 use crate::config::Config;
+use crate::canbus::CanBuffer;
 
 #[derive(clap::Parser)]
 struct Options {
@@ -46,66 +47,33 @@ async fn do_main(options: Options) -> Result<(), ()> {
 
     let speed_factor = config.general.speed_factor;
 
-    // Initialze controllers
-    let mut controllers = Vec::new();
+    // Initialize can bus
+    let can_buffer = CanBuffer::new(&config.bus);
 
-    // Build nodes from eds files and bind socket
+    // Run can receive socket
+    let queue_clone = Arc::clone(&can_buffer.read_queue);
+    let can_rx_handle = task::spawn(async move {
+        canbus::run_can_socket(can_buffer.can_socket, queue_clone).await
+    });
+
+    let can_socket_tx = Arc::new(TokioMutex::new(canbus::start_can_socket(&config.bus)?));
+
+    // Initialze and run fake controllers
     for node in config.node.iter() {
-
-        // Bind socket
-        let socket = CanSocket::bind(&config.bus.interface).map_err(|e| {
-            log::error!("Failed to create CAN socket for interface {}: {e}", &config.bus.interface)
-        })?;
-        log::info!("CAN bus on interface {} opened for node {}", &config.bus.interface, node.node_id);
 
         // Parse eds data
         let node_id = node.node_id;
         let node_data = eds::parse_eds(&node_id, &node.eds_file).unwrap();
 
-        // Initialize node
-        let controller = Arc::new(Mutex::new(
-            MotorController::initialize(Node::new(socket, node_id, node_data))
-        ));
-        controllers.push(controller);
+        // Initialize controller
+        let controller = Arc::new(TokioMutex::new(MotorController::initialize(Arc::clone(&can_socket_tx), Arc::clone(&can_buffer.read_queue), node_id, node_data).await));
+        log::info!("Node {} initialized", node_id);
 
+        cia402_runner::run(Arc::clone(&controller), &speed_factor).await
     }
 
-    let mut futures = Vec::new();
-
-    // Start nodes
-    for controller in controllers.iter() {
-        let controller_clone: Arc<Mutex<MotorController>>  = Arc::clone(&controller);
-        futures.push(
-            task::spawn(async move {
-                loop {
-
-                    tokio::time::sleep(tokio::time::Duration::from_micros(1)).await;
-
-                    let mut controller = controller_clone.lock().await;
-
-                    controller.node.socket_listener().await;
-
-                }
-            })
-        );
-        let controller_clone: Arc<Mutex<MotorController>>  = Arc::clone(&controller);
-        futures.push(
-            task::spawn(async move {
-                loop {
-
-                    tokio::time::sleep(tokio::time::Duration::from_micros(1)).await;
-
-                    let mut controller = controller_clone.lock().await;
-                        
-                    controller.update_controller(&speed_factor).await;
-                    
-                }
-            })
-        );
-    }
-
-    future::join_all(futures).await;
+    // Keep the rx handle running
+    can_rx_handle.await.ok();
     
     Ok(())
 }
-

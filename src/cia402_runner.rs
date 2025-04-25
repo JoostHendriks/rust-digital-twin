@@ -2,12 +2,18 @@ use std::time::{Instant, Duration};
 use std::collections::{BTreeMap, HashMap};
 use std::collections::VecDeque;
 use s_curve::*;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+use can_socket::tokio::CanSocket;
+use can_socket::CanFrame;
+use tokio::task;
+use tokio::time::sleep;
 
-use crate::eds::{get_dataval, get_val, set_dataval, DataValue};
-use crate::cia301::Node;
+use crate::eds::{get_dataval, get_val, set_dataval, DataValue, EDSData};
+use crate::cia301::{Node, consume_read_queue};
 
 pub struct MotorController {
-    pub node: Node,
+    pub node: Arc<TokioMutex<Node>>,
     pub status: Status,
     pub mode_of_operation_display: ModeOfOperation,
     pub controlword: u16,
@@ -122,7 +128,17 @@ impl ModeOfOperation {
 impl MotorController {
 
     /// Initialize the motor controller.
-    pub fn initialize(node: Node) -> Self {
+    pub async fn initialize(
+        socket: Arc<TokioMutex<CanSocket>>,
+        read_queue: Arc<TokioMutex<Vec<CanFrame>>>,
+        node_id: u8,
+        eds_data: EDSData,
+    ) -> Self {
+
+        let node = Arc::new(TokioMutex::new(Node::new(socket, node_id, eds_data).await));
+
+        consume_read_queue(Arc::clone(&node), read_queue).await;
+
         let mut controller = Self {
             node,
             status: Default::default(),
@@ -155,18 +171,9 @@ impl MotorController {
         controller
     }
 
-    pub async fn update_controller(&mut self, speed_factor: &f64) {
-
-        self.update_mode_of_operation();
-        self.update_command();
-        self.update_state();
-        self.update_operation(speed_factor).await;
-        self.set_statusword().await;
-    
-    }
-
-
     async fn update_operation(&mut self, speed_factor: &f64) {
+
+        let mut node = self.node.lock().await;
 
         match (&self.mode_of_operation_display, &self.state) {
 
@@ -183,17 +190,17 @@ impl MotorController {
 
                         if self.start_travel {
 
-                            let acceleration = get_val(0x6083, 0, &mut self.node.eds_data);
-                            let max_acceleration = get_val(0x60C5, 0, &mut self.node.eds_data);
-                            let profile_velocity = get_val(0x6081, 0, &mut self.node.eds_data);
-                            let target_position = get_val(0x607A, 0, &mut self.node.eds_data);
+                            let acceleration = get_val(0x6083, 0, &mut node.eds_data);
+                            let max_acceleration = get_val(0x60C5, 0, &mut node.eds_data);
+                            let profile_velocity = get_val(0x6081, 0, &mut node.eds_data);
+                            let target_position = get_val(0x607A, 0, &mut node.eds_data);
 
                             match (acceleration, max_acceleration, profile_velocity, target_position) {
                                 (Some(acceleration), Some(max_acceleration), Some(profile_velocity), Some(target_position)) => {
 
-                                    log::debug!("Trying to move node {} with: max_acc: {} acc: {}, vel: {}, curr: {}, dest: {}", self.node.id, max_acceleration, acceleration, profile_velocity, self.actual_position, target_position);
+                                    log::debug!("Trying to move node {} with: max_acc: {} acc: {}, vel: {}, curr: {}, dest: {}", node.id, max_acceleration, acceleration, profile_velocity, self.actual_position, target_position);
 
-                                    match position_motion_map(self.node.id, &acceleration, &max_acceleration, &profile_velocity, &self.actual_position, &target_position, &self.relative, speed_factor) {
+                                    match position_motion_map(node.id, &acceleration, &max_acceleration, &profile_velocity, &self.actual_position, &target_position, &self.relative, speed_factor) {
                                         Ok(motion_map) => {
                                             self.motion_map = motion_map;
                                             self.max_acceleration = None;
@@ -223,7 +230,7 @@ impl MotorController {
                         if let Some(just_passed_point) = self.motion_map.range(..=elapsed_time).next_back().map(|(&key, _)| key) {
                             if let Some(new_actual_position) = self.motion_map.get(&just_passed_point) {
 
-                                log::info!("Actual position node {}: {}", self.node.id, new_actual_position);
+                                log::info!("Actual position node {}: {}", node.id, new_actual_position);
 
                                 if self.actual_position != *new_actual_position {
                                     self.actual_position = *new_actual_position;
@@ -340,12 +347,12 @@ impl MotorController {
                         self.target_reached = true;
                         self.status_oms2 = false;
 
-                        if self.node.id == 1 {
+                        if node.id == 1 {
                             println!("Waiting to home");
                         }
 
                         if self.control_oms1[0] && !self.control_oms1[1] {
-                            if self.node.id == 1 {
+                            if node.id == 1 {
                                 println!("Start homing");
                             }
                             self.timer = Instant::now();
@@ -376,9 +383,11 @@ impl MotorController {
 
     }
 
-    fn update_command(&mut self) {
+    async fn update_command(&mut self) {
 
-        let controlword = match get_dataval(0x6040, 0, &mut self.node.eds_data) {
+        let mut node = self.node.lock().await;
+
+        let controlword = match get_dataval(0x6040, 0, &mut node.eds_data) {
             Some(DataValue::Unsigned16(value)) => value,
             _ => panic!("Controlword not found"),
         };
@@ -396,10 +405,6 @@ impl MotorController {
             (true, _, _, _, _) => Command::FaultReset,
         };
 
-        if self.node.id == 1 {
-            println!("{:?}", self.command);
-        }
-
         self.control_oms1.push_front(get_bit_16(&self.controlword, 4));
         self.control_oms1.pop_back();
 
@@ -407,9 +412,11 @@ impl MotorController {
         self.halt = get_bit_16(&self.controlword, 8);
     }
 
-    fn update_mode_of_operation(&mut self) {
+    async fn update_mode_of_operation(&mut self) {
 
-        let mode_of_operation = match get_dataval(0x6060, 0, &mut self.node.eds_data) {
+        let mut node = self.node.lock().await;
+
+        let mode_of_operation = match get_dataval(0x6060, 0, &mut node.eds_data) {
             Some(DataValue::Integer8(value)) => ModeOfOperation::mode_of_operation(value),
             _ => panic!("Mode of operation not found"),
         };
@@ -421,7 +428,7 @@ impl MotorController {
             self.profile_position_status = ProfilePositionStatus::SetpointAcknownlegde;
             self.profile_velocity_status = ProfileVelocityStatus::WaitingForStart;
 
-            set_dataval(0x6061, 0, DataValue::Integer8(self.mode_of_operation_display.clone() as i8), &mut self.node.eds_data);
+            set_dataval(0x6061, 0, DataValue::Integer8(self.mode_of_operation_display.clone() as i8), &mut node.eds_data);
 
         }
     }
@@ -467,6 +474,8 @@ impl MotorController {
     
     async fn set_statusword(&mut self) {
 
+        let mut node = self.node.lock().await;
+
         let mut statusword = self.status.statusword;
 
         let bit_configs: HashMap<State, Vec<(usize, bool)>> = HashMap::from([
@@ -492,7 +501,7 @@ impl MotorController {
 
             self.status.statusword = statusword;
 
-            set_dataval(0x6041, 0, DataValue::Unsigned16(self.status.statusword.clone()), &mut self.node.eds_data);
+            set_dataval(0x6041, 0, DataValue::Unsigned16(self.status.statusword.clone()), &mut node.eds_data);
 
         }
     }
@@ -593,4 +602,20 @@ fn position_motion_map(
     log::debug!("Duration move: {}", total_duration);
 
     Ok(motion_map)
+}
+
+
+pub async fn run(controller: Arc<TokioMutex<MotorController>>, speed_factor: &f64) {
+    task::spawn(async move {
+        loop {
+            let mut controller = controller.lock().await;
+            controller.update_mode_of_operation().await;
+            // self.update_command().await;
+            // self.update_state();
+            // self.update_operation(speed_factor).await;
+            // self.set_statusword().await;
+
+        sleep(Duration::from_millis(10)).await;
+        }
+    });
 }
