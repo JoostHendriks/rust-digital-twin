@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::time::Instant;
 use std::collections::VecDeque;
 
@@ -52,9 +51,6 @@ enum ServerCommand {
 
 	/// The server is aborting the transfer.
 	_AbortTransfer = 4,
-
-    /// Unknown server command.
-    Unknown = 5,
 }
 
 #[derive(Debug)]
@@ -105,61 +101,54 @@ impl Node {
             eds_data,
             nmt_state: NmtState::Initializing,
             socket,
-            motor_controller: {Default::default()}
+            motor_controller: Default::default()
         };
         node.motor_controller.control_oms1 = VecDeque::from(vec![false; 2]);
         Ok(node)
     }
 
     pub async fn start_socket(&mut self) {
-
-        // Start receiving frames over socket
         loop {
-
-            // Check if a frame is received
-            if let Some(frame) = self.socket.recv().await.ok() {
-
-                // Extract id and cob_id
-                let cob_id = frame.id().as_u32();
-                let node_id = (cob_id & 0x7F) as u8;
-                let function_code = frame.id().as_u32() & (0x0F << 7);
-
-                // Parse frame
-                if node_id == 0 {
-
-                    match function_code {
-                        0x000 => self.parse_nmt_command(&frame.data()).await,
-                        0x080 => self.parse_sync().await,
-                        _ => {},
-                    }
-
-                } else if node_id == self.node_id {
-
-                    match function_code {
-                        0x080 => self.parse_emcy().await,
-                        0x200 => self.parse_rpdo(&1, &frame.data()).await,
-                        0x300 => self.parse_rpdo(&2, &frame.data()).await,
-                        0x400 => self.parse_rpdo(&3, &frame.data()).await,
-                        0x500 => self.parse_rpdo(&4, &frame.data()).await,
-                        0x600 => self.parse_sdo_client_request(&frame.data()).await,
-                        _ => {},
-                    }
-                    
+            let frame = match self.socket.recv().await {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("Error receiving frame: {}", e);
+                    continue;
                 }
+            };
 
-                if cob_id == 0x080 {
-                    self.update_controller().await;
+            let cob_id = frame.id().as_u32();
+            let node_id = (cob_id & 0x7F) as u8;
+            let function_code = frame.id().as_u32() & (0x0F << 7);
+
+            if node_id == 0 {
+                match function_code {
+                    0x000 => self.parse_nmt_command(&frame.data()).await,
+                    0x080 => self.parse_sync().await,
+                    _ => {},
                 }
+            } else if node_id == self.node_id {
+                match function_code {
+                    0x080 => self.parse_emcy().await,
+                    0x200 => self.parse_rpdo(&1, &frame.data()).await,
+                    0x300 => self.parse_rpdo(&2, &frame.data()).await,
+                    0x400 => self.parse_rpdo(&3, &frame.data()).await,
+                    0x500 => self.parse_rpdo(&4, &frame.data()).await,
+                    0x600 => self.parse_sdo_client_request(&frame.data()).await,
+                    _ => {},
+                }
+            }
 
+            if cob_id == 0x080 {
+                self.update_controller().await;
             }
         }
-
     }
 
     async fn parse_nmt_command(&mut self, data: &[u8]) {
 
         // Check if the data the correct size
-        if !(data.len() == 2) {
+        if data.len() != 2 {
             log::error!("Received incorrect frame data length for NMT state change");
         }
 
@@ -174,7 +163,10 @@ impl Node {
             0x80 => NmtCommand::GoToPreOperational,
             0x81 => NmtCommand::Reset,
             0x82 => NmtCommand::ResetCommunication,
-            _ => panic!("Unexpected requested state: {:#X}", requested_state),
+            _ => {
+                log::warn!("Unknown NMT requested state: {:#X}", requested_state);
+                return;
+            }
         };
 
         // Change NMT state
@@ -195,8 +187,7 @@ impl Node {
 
     pub async fn send_new_nmt_state(&mut self) {
 
-        let cob = u16::from_str_radix("700", 16).unwrap();
-        let cob_id = CanId::new_base(cob | self.node_id as u16).unwrap();
+        let cob_id = CanId::new_base(0x0700 | self.node_id as u16).unwrap();
 
         let data: [u8; 1] = [match self.nmt_state {
             NmtState::Initializing => 0x00,
@@ -233,325 +224,144 @@ impl Node {
     }
 
     async fn sdo_response(&mut self, command: &ClientCommand, input_data: &[u8]) {
+        let index     = u16::from_le_bytes([input_data[1], input_data[2]]);
+        let sub_index = input_data[3];
 
-        let input_index = u16::from_le_bytes([input_data[1], input_data[2]]);
-        let input_sub_index = input_data[3];
+        let Some(var) = self.eds_data.od
+            .get_mut(&index)
+            .and_then(|vars| vars.get_mut(&sub_index))
+        else { return };
 
-        if let Some(var) = self.eds_data.od.get_mut(&input_index)
-            .and_then(|vars| vars.get_mut(&input_sub_index)) {
+        let mut frame_data = [0u8; 8];
+        frame_data[1..3].copy_from_slice(&index.to_le_bytes());
+        frame_data[3] = sub_index;
 
-                let mut data: [u8; 8] = [0; 8];
-                let mut scs = ServerCommand::Unknown;
-                let mut n = 0;
-                let mut s = 0;
-                let mut e = 0;
-
-                match command {
-                    ClientCommand::InitiateUpload => {
-
-                        s = 1;
-                        e = 1;
-                        scs = ServerCommand::InitiateUploadResponse;
-
-                        match var.value {
-                            DataValue::Integer8(value) => {
-                                n = 3;
-                                data[4] = value as u8;
-                            }
-                            DataValue::Integer16(value) => {
-                                n = 2;
-                                data[4..6].copy_from_slice(&value.to_le_bytes());
-                            }
-                            DataValue::Integer32(value) => data[4..].copy_from_slice(&value.to_le_bytes()),
-                            DataValue::Unsigned8(value) => {
-                                n = 3;
-                                data[4] = value;
-                            }
-                            DataValue::Unsigned16(value) => {
-                                n = 2;
-                                data[4..6].copy_from_slice(&value.to_le_bytes());
-                            }
-                            DataValue::Unsigned32(value) => data[4..].copy_from_slice(&value.to_le_bytes()),
-                            _ => log::error!("Data type not implemented for initiate upload"),
-                        };
-                    }
-                    ClientCommand::InitiateDownload => {
-
-                        // Update value with incoming data
-                        match var.value {
-                            DataValue::Integer8(_) => var.value = DataValue::Integer8(input_data[4] as i8),
-                            DataValue::Integer16(_) => var.value = DataValue::Integer16(i16::from_le_bytes([input_data[4], input_data[5]])),
-                            DataValue::Integer32(_) => var.value = DataValue::Integer32(i32::from_le_bytes([input_data[4], input_data[5], input_data[6], input_data[7]])),
-                            DataValue::Unsigned8(_) => var.value = DataValue::Unsigned8(input_data[4]),
-                            DataValue::Unsigned16(_) => var.value = DataValue::Unsigned16(u16::from_le_bytes([input_data[4], input_data[5]])),
-                            DataValue::Unsigned32(_) => var.value = DataValue::Unsigned32(u32::from_le_bytes([input_data[4], input_data[5], input_data[6], input_data[7]])),
-                            _ => log::error!("Data type not implemented for initiate download"),
-                        }
-
-                        s = 0;
-                        e = 0;
-                        scs = ServerCommand::InitiateDownloadResponse;
-                        
-                    }
-                    _ => log::error!("Client command not implemented"),
-                }
-
-                data[0] = data[0] | (scs as u8 & 0b111) << 5;
-                data[0] = data[0] | (n & 0b11) << 2;
-                data[0] = data[0] | e << 1;
-                data[0] = data[0] | s << 0;
-
-                data[1..3].copy_from_slice(&input_index.to_le_bytes());
-
-                data[3] = input_sub_index;
-
-                let cob = u16::from_str_radix("580", 16).unwrap();
-                let cob_id = CanId::new_base(cob | self.node_id as u16).unwrap();
-
-                let frame = &CanFrame::new(
-                    cob_id,
-                    &data,
-                    None,
-                )
-                .unwrap();
-
-                if let Err(_) = self.socket.send(frame).await {
-                    log::error!("Error sending frame");
-                }
-
+        match command {
+            ClientCommand::InitiateUpload => {
+                let n = sdo_fill_upload(&var.value, &mut frame_data);
+                frame_data[0] = (ServerCommand::InitiateUploadResponse as u8 & 0b111) << 5
+                    | (n & 0b11) << 2 | 1 << 1 | 1;
+            }
+            ClientCommand::InitiateDownload => {
+                sdo_write_download(input_data, &mut var.value);
+                frame_data[0] = (ServerCommand::InitiateDownloadResponse as u8 & 0b111) << 5;
+            }
+            _ => { log::error!("Client command not implemented"); return; }
         }
 
+        self.send_sdo_frame(&frame_data).await;
+    }
+
+    async fn send_sdo_frame(&self, data: &[u8]) {
+        let cob_id = CanId::new_base(0x0580 | self.node_id as u16).unwrap();
+        let frame = CanFrame::new(cob_id, data, None).unwrap();
+        if let Err(_) = self.socket.send(&frame).await {
+            log::error!("Error sending SDO response");
+        }
     }
 
     async fn parse_rpdo(&mut self, rpdo_number: &u16, input_data: &[u8]) {
-
-        let mut enabled_sub_indices: u8 = 0;
-        let mut rpdo_indices: BTreeMap<u8, u32> = BTreeMap::new();
-
-        if let Some(var) = self.eds_data.od.get(&(0x1600 | (*rpdo_number - 1)))
-            .and_then(|vars| vars.get(&0)) {
-                match var.value {
-                    DataValue::Unsigned8(value) => {
-                        enabled_sub_indices = value;
-                    }
-                    _ => {},
-                }
-            }
-
-        if let Some(vars) = self.eds_data.od.get(&(0x1600 | (*rpdo_number - 1))) {
-            for (sub_index, var) in vars.iter() {
-                if *sub_index != 0 as u8 {
-                    match var.value {
-                        DataValue::Unsigned32(value) => {
-                            rpdo_indices.insert(*sub_index, value);
-                        }
-                        _ => {},
-                    }
-                }
-            }
-        }
-
+        let mappings = self.rpdo_mappings(*rpdo_number);
         let mut data = input_data;
 
-        for i in 0..enabled_sub_indices {
+        for mapping in &mappings {
+            if data.is_empty() { break; }
 
-            if let Some(rpdo_index_value) = rpdo_indices.get(&(i + 1)) {
+            let index     = (mapping >> 16) as u16;
+            let sub_index = ((mapping >> 8) & 0xFF) as u8;
+            let data_type = (mapping & 0xFF) as u8;
 
-                let index_to_set = (rpdo_index_value >> 16) as u16;
-                let sub_index_to_set = ((rpdo_index_value >> 8) & 0xFF) as u8;
-                let data_type = (rpdo_index_value & 0xFF) as u8;
-
-                if let Some(vars) = self.eds_data.od.get_mut(&index_to_set) {
-
-                    for (sub_index, var) in vars.iter_mut() {
-
-                        if sub_index == &sub_index_to_set {
-
-                            // Break loop when there is no data left
-                            if data == &[] {
-                                break;
-                            }
-
-                            match (data_type, &var.value) {
-                                (0x08, DataValue::Unsigned8(_)) => {
-                                    var.value = DataValue::Unsigned8(data[0]);
-                                    data = drop_front(data, 1);
-                                }
-                                (0x08, DataValue::Integer8(_)) => {
-                                    var.value = DataValue::Integer8(data[0] as i8);
-                                    data = drop_front(data, 1);
-                                }
-                                (0x10, DataValue::Unsigned16(_)) => {
-                                    var.value = DataValue::Unsigned16(u16::from_le_bytes([data[0], data[1]]));
-                                    data = drop_front(data, 2);
-                                }
-                                (0x10, DataValue::Integer16(_)) => {
-                                    var.value = DataValue::Integer16(i16::from_le_bytes([input_data[0], input_data[1]]));
-                                    data = drop_front(data, 2);
-                                }
-                                (0x20, DataValue::Unsigned32(_)) => {
-                                    var.value = DataValue::Unsigned32(u32::from_le_bytes([input_data[0], input_data[1], input_data[2], input_data[3]]));
-                                    data = drop_front(data, 4);
-                                }
-                                (0x20, DataValue::Integer32(_)) => {
-                                    var.value = DataValue::Integer32(i32::from_le_bytes([input_data[0], input_data[1], input_data[2], input_data[3]]));
-                                    data = drop_front(data, 4);
-                                }
-                                _ => log::error!("Data type not implemented. Data type: 0x{:X}, data value: {:?}", data_type, var.value)
-                            };
-                        }
-                    }
-                }
+            if let Some(var) = self.eds_data.od
+                .get_mut(&index)
+                .and_then(|vars| vars.get_mut(&sub_index))
+            {
+                let consumed = decode_rpdo_value(data, data_type, &mut var.value);
+                data = drop_front(data, consumed);
             }
         }
     }
 
+    fn rpdo_mappings(&self, rpdo_number: u16) -> Vec<u32> {
+        let vars = match self.eds_data.od.get(&(0x1600 | (rpdo_number - 1))) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+
+        let count = vars.get(&0)
+            .and_then(|v| if let DataValue::Unsigned8(n) = v.value { Some(n) } else { None })
+            .unwrap_or(0);
+
+        (1..=count)
+            .filter_map(|i| vars.get(&i))
+            .filter_map(|v| if let DataValue::Unsigned32(m) = v.value { Some(m) } else { None })
+            .collect()
+    }
+
     async fn parse_sync(&self) {
+        for tpdo_idx in 0..8u16 {
+            if !self.tpdo_is_sync_active(tpdo_idx) {
+                continue;
+            }
+            let payload = self.build_tpdo_payload(tpdo_idx);
+            self.send_tpdo(tpdo_idx, &payload).await;
+        }
+    }
 
-        let mut tpdos_enabled: BTreeMap<u16, bool> = BTreeMap::new();
-        let mut tpdos_sync_type: BTreeMap<u16, u8> = BTreeMap::new();
-        let mut number_of_entries: BTreeMap<u16, u8> = BTreeMap::new();
-        let mut tpdo_objects: BTreeMap<&u16, BTreeMap<u8, u32>> = BTreeMap::new();
+    fn tpdo_is_sync_active(&self, tpdo_idx: u16) -> bool {
+        let vars = match self.eds_data.od.get(&(0x1800 + tpdo_idx)) {
+            Some(v) => v,
+            None => return false,
+        };
 
+        let enabled = vars.get(&1)
+            .and_then(|v| if let DataValue::Unsigned32(val) = v.value { Some(val) } else { None })
+            .map(|val| (val & (1 << 31)) == 0)
+            .unwrap_or(false);
 
-        for i in 0..8 {
-            if let Some(vars) = self.eds_data.od.get(&(0x1800 + i)) {
-                for (sub_index, var) in vars.iter() {
+        let sync_type = vars.get(&2)
+            .and_then(|v| if let DataValue::Unsigned8(val) = v.value { Some(val) } else { None })
+            .unwrap_or(0);
 
-                    if *sub_index == 1 as u8 {
-                        match var.value {
-                            DataValue::Unsigned32(value) => {
-                                let tpdo_enabled = !((value & (1 << 31)) != 0);
-                                tpdos_enabled.insert(i, tpdo_enabled);
-                            }
-                            _ => {},
-                        }
-                    }
+        enabled && sync_type == 255
+    }
 
-                    if *sub_index == 2 as u8 {
-                        match var.value {
-                            DataValue::Unsigned8(value) => {
-                                tpdos_sync_type.insert(i, value);
-                            }
-                            _ => {},
-                        }
-                    }
-                }
-            } 
-            
-            if let Some(vars) = self.eds_data.od.get(&(0x1A00 + i)) {
-                for (sub_index, var) in vars.iter() {
-                    if *sub_index == 0 as u8 {
-                        match var.value {
-                            DataValue::Unsigned8(value) => {
-                                number_of_entries.insert(i, value);
-                            }
-                            _ => {},
-                        }
-                    }
-                }
+    fn build_tpdo_payload(&self, tpdo_idx: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+
+        let mapping_vars = match self.eds_data.od.get(&(0x1A00 + tpdo_idx)) {
+            Some(v) => v,
+            None => return payload,
+        };
+
+        let count = mapping_vars.get(&0)
+            .and_then(|v| if let DataValue::Unsigned8(n) = v.value { Some(n) } else { None })
+            .unwrap_or(0);
+
+        for i in 1..=count {
+            let mapping = match mapping_vars.get(&i)
+                .and_then(|v| if let DataValue::Unsigned32(m) = v.value { Some(m) } else { None })
+            {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let index     = (mapping >> 16) as u16;
+            let sub_index = ((mapping >> 8) & 0xFF) as u8;
+            let data_type = (mapping & 0xFF) as u8;
+
+            if let Some(var) = self.eds_data.od.get(&index).and_then(|vars| vars.get(&sub_index)) {
+                encode_tpdo_value(&var.value, data_type, &mut payload);
             }
         }
 
-        for tpdo_number in tpdos_enabled.keys() {
-            if let (Some(tpdo_enabled), Some(sync_type), Some(number_of_entries)) = (tpdos_enabled.get(tpdo_number), tpdos_sync_type.get(tpdo_number), number_of_entries.get(tpdo_number)) {
-                if *tpdo_enabled && *sync_type == 255 {
+        payload
+    }
 
-                    if let Some(vars) = self.eds_data.od.get(&(0x1A00 + tpdo_number)) {
-                    
-                        for i in 1..(*number_of_entries + 1) {
-
-                            for (sub_index, var) in vars.iter() {
-                                if *sub_index == i as u8 {
-                                    match var.value {
-                                        DataValue::Unsigned32(value) => {
-                                            tpdo_objects.entry(tpdo_number)
-                                                .or_insert_with(BTreeMap::new)
-                                                .insert(i, value);  
-                                        }
-                                        _ => {},
-                                    }
-                                }
-                            }  
-                        }
-                    }
-                }
-            }
-        }
-
-
-        for tpdo_object_nr in tpdo_objects.keys() {
-
-            let mut data_to_send: Vec<u8> = Vec::new();
-
-            if let Some(tpdo_sub_indices) = tpdo_objects.get(tpdo_object_nr) {
-
-                let tpdo_number = tpdo_object_nr;
-
-                for sub_index in tpdo_sub_indices.keys() {
-
-                    if let Some(tpdo_content) = tpdo_sub_indices.get(sub_index) {
-
-                        let index_to_find = (tpdo_content >> 16) as u16;
-                        let sub_index_to_find = ((tpdo_content >> 8) & 0xFF) as u8;
-                        let data_type = (tpdo_content & 0xFF) as u8;
-
-                        if let Some(vars) = self.eds_data.od.get(&index_to_find) {
-                            for (sub_index, var) in vars.iter() {
-
-                                if sub_index == &sub_index_to_find {
-
-                                    match data_type {
-                                        0x08 => match var.value {
-                                            DataValue::Unsigned8(value) => {
-                                                data_to_send.extend(&value.to_le_bytes())
-                                            }
-                                            DataValue::Integer8(value) => {
-                                                data_to_send.extend(&value.to_le_bytes())
-                                            }
-                                            _ => {},
-                                        }
-                                        0x10 => match var.value {
-                                            DataValue::Unsigned16(value) => {
-                                                data_to_send.extend(&value.to_le_bytes())
-                                            }
-                                            DataValue::Integer16(value) => {
-                                                data_to_send.extend(&value.to_le_bytes())
-                                            }
-                                            _ => {},
-                                        }
-                                        0x20 => match var.value {
-                                            DataValue::Unsigned32(value) => {
-                                                data_to_send.extend(&value.to_le_bytes())
-                                            }
-                                            DataValue::Integer32(value) => {
-                                                data_to_send.extend(&value.to_le_bytes())
-                                            }
-                                            _ => {},
-                                        }
-                                        _ => {},
-                                        
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-    
-                let functions_code = u16::from_str_radix(format!("{}80", *tpdo_number + 1).as_str(), 16).unwrap();
-                let cob_id = CanId::new_base(functions_code | self.node_id as u16).unwrap();
-    
-                let frame = &CanFrame::new(
-                    cob_id,
-                    &data_to_send.as_slice(),
-                    None,
-                )
-                .unwrap();
-
-                if let Err(_) = self.socket.send(frame).await {
-                    log::error!("Error sending frame");
-                }
-            }
+    async fn send_tpdo(&self, tpdo_idx: u16, payload: &[u8]) {
+        let cob_id = CanId::new_base(0x180 + tpdo_idx * 0x100 | self.node_id as u16).unwrap();
+        let frame = CanFrame::new(cob_id, payload, None).unwrap();
+        if let Err(_) = self.socket.send(&frame).await {
+            log::error!("Error sending TPDO {}", tpdo_idx + 1);
         }
     }
 
@@ -568,5 +378,62 @@ fn drop_front(slice: &[u8], count: usize) -> &[u8] {
         &[]
     } else {
         &slice[count..]
+    }
+}
+
+fn sdo_fill_upload(value: &DataValue, buf: &mut [u8; 8]) -> u8 {
+    match value {
+        DataValue::Integer8(v)   => { buf[4] = *v as u8;                               3 }
+        DataValue::Unsigned8(v)  => { buf[4] = *v;                                     3 }
+        DataValue::Integer16(v)  => { buf[4..6].copy_from_slice(&v.to_le_bytes());     2 }
+        DataValue::Unsigned16(v) => { buf[4..6].copy_from_slice(&v.to_le_bytes());     2 }
+        DataValue::Integer32(v)  => { buf[4..8].copy_from_slice(&v.to_le_bytes());     0 }
+        DataValue::Unsigned32(v) => { buf[4..8].copy_from_slice(&v.to_le_bytes());     0 }
+        _ => { log::error!("Data type not implemented for SDO upload"); 0 }
+    }
+}
+
+fn sdo_write_download(input_data: &[u8], target: &mut DataValue) {
+    match target {
+        DataValue::Integer8(v)   => *v = input_data[4] as i8,
+        DataValue::Unsigned8(v)  => *v = input_data[4],
+        DataValue::Integer16(v)  => *v = i16::from_le_bytes([input_data[4], input_data[5]]),
+        DataValue::Unsigned16(v) => *v = u16::from_le_bytes([input_data[4], input_data[5]]),
+        DataValue::Integer32(v)  => *v = i32::from_le_bytes([input_data[4], input_data[5], input_data[6], input_data[7]]),
+        DataValue::Unsigned32(v) => *v = u32::from_le_bytes([input_data[4], input_data[5], input_data[6], input_data[7]]),
+        _ => log::error!("Data type not implemented for SDO download"),
+    }
+}
+
+fn decode_rpdo_value(data: &[u8], data_type: u8, target: &mut DataValue) -> usize {
+    match (data_type, &*target) {
+        (0x08, DataValue::Unsigned8(_))  => { *target = DataValue::Unsigned8(data[0]);                                                    1 }
+        (0x08, DataValue::Integer8(_))   => { *target = DataValue::Integer8(data[0] as i8);                                               1 }
+        (0x10, DataValue::Unsigned16(_)) => { *target = DataValue::Unsigned16(u16::from_le_bytes([data[0], data[1]]));                    2 }
+        (0x10, DataValue::Integer16(_))  => { *target = DataValue::Integer16(i16::from_le_bytes([data[0], data[1]]));                     2 }
+        (0x20, DataValue::Unsigned32(_)) => { *target = DataValue::Unsigned32(u32::from_le_bytes([data[0], data[1], data[2], data[3]])); 4 }
+        (0x20, DataValue::Integer32(_))  => { *target = DataValue::Integer32(i32::from_le_bytes([data[0], data[1], data[2], data[3]])); 4 }
+        _ => { log::error!("Data type 0x{:X} not implemented for value: {:?}", data_type, target); 0 }
+    }
+}
+
+fn encode_tpdo_value(value: &DataValue, data_type: u8, buf: &mut Vec<u8>) {
+    match data_type {
+        0x08 => match value {
+            DataValue::Unsigned8(v)  => buf.extend(v.to_le_bytes()),
+            DataValue::Integer8(v)   => buf.extend(v.to_le_bytes()),
+            _ => {},
+        },
+        0x10 => match value {
+            DataValue::Unsigned16(v) => buf.extend(v.to_le_bytes()),
+            DataValue::Integer16(v)  => buf.extend(v.to_le_bytes()),
+            _ => {},
+        },
+        0x20 => match value {
+            DataValue::Unsigned32(v) => buf.extend(v.to_le_bytes()),
+            DataValue::Integer32(v)  => buf.extend(v.to_le_bytes()),
+            _ => {},
+        },
+        _ => {},
     }
 }
