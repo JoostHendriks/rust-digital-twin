@@ -1,5 +1,4 @@
 use std::time::{Instant, Duration};
-use std::collections::HashMap;
 
 use crate::cia301::Node;
 use crate::eds::DataValue;
@@ -23,14 +22,13 @@ pub enum Command {
 	SwitchOn,
 	DisableVoltage,
 	QuickStop,
-	DisableOperation,
 	EnableOperation,
 	EnableOperationAfterQuickStop,
 	FaultReset
 }
 
 /// Statusword
-#[derive(Default, Debug, PartialEq, Hash, Eq)]
+#[derive(Default, Debug, PartialEq)]
 pub enum State {
     #[default]
 	NotReadyToSwitchOn,
@@ -290,21 +288,18 @@ impl Node {
     }
     
     fn set_statusword(&mut self) {
-        let bit_configs: HashMap<State, Vec<(usize, bool)>> = HashMap::from([
-            (State::NotReadyToSwitchOn, vec![(0, false), (1, false), (2, false), (3, false), (5, false), (6, false)]),
-            (State::SwitchedOnDisabled, vec![(0, false), (1, false), (2, false), (3, false), (6, true)]),
-            (State::ReadyToSwitchOn, vec![(0, true), (1, false), (2, false), (3, false), (5, true), (6, false)]),
-            (State::SwitchedOn, vec![(0, true), (1, true), (2, false), (3, false), (5, true), (6, false)]),
-            (State::OperationEnabled, vec![(0, true), (1, true), (2, true), (3, false), (5, true), (6, false)]),
-            (State::QuickStopActive, vec![(0, true), (1, true), (2, true), (3, false), (5, false), (6, false)]),
-            (State::FaultReactionActive, vec![(0, true), (1, true), (2, true), (3, true), (6, false)]),
-            (State::Fault, vec![(0, false), (1, false), (2, false), (3, true), (6, false)]),
-        ]);
-    
-        if let Some(bits) = bit_configs.get(&self.motor_controller.state) {
-            set_bits(&mut self.motor_controller.statusword, bits);
-        }
-    
+        let bits: &[(usize, bool)] = match self.motor_controller.state {
+            State::NotReadyToSwitchOn  => &[(0, false), (1, false), (2, false), (3, false), (5, false), (6, false)],
+            State::SwitchedOnDisabled  => &[(0, false), (1, false), (2, false), (3, false), (6, true)],
+            State::ReadyToSwitchOn     => &[(0, true),  (1, false), (2, false), (3, false), (5, true),  (6, false)],
+            State::SwitchedOn          => &[(0, true),  (1, true),  (2, false), (3, false), (5, true),  (6, false)],
+            State::OperationEnabled    => &[(0, true),  (1, true),  (2, true),  (3, false), (5, true),  (6, false)],
+            State::QuickStopActive     => &[(0, true),  (1, true),  (2, true),  (3, false), (5, false), (6, false)],
+            State::FaultReactionActive => &[(0, true),  (1, true),  (2, true),  (3, true),  (6, false)],
+            State::Fault               => &[(0, false), (1, false), (2, false), (3, true),  (6, false)],
+        };
+        set_bits(&mut self.motor_controller.statusword, bits);
+
         self.motor_controller.statusword = set_bit_16(&self.motor_controller.statusword, 10, self.motor_controller.target_reached);
         self.motor_controller.statusword = set_bit_16(&self.motor_controller.statusword, 12, self.motor_controller.status_oms1);
         self.motor_controller.statusword = set_bit_16(&self.motor_controller.statusword, 13, self.motor_controller.status_oms2);
