@@ -85,12 +85,16 @@ fn parse_default_value(node_id: u8, data_type: DataType, default_value: &str) ->
             Ok(DataValue::Unknown(0))
         }
         DataType::Boolean => {
-            let val = default_value.parse::<bool>().map_err(|_| "Invalid Boolean value")?;
+            let val = match default_value {
+                "0" => false,
+                "1" => true,
+                other => other.parse::<bool>().map_err(|_| "Invalid Boolean value")?,
+            };
             Ok(DataValue::Boolean(val))
         }
         DataType::Integer8 => {
             if default_value.contains("0x") {
-                let val = i8::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid i8 value")?;
+                let val = u8::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid i8 value")? as i8;
                 Ok(DataValue::Integer8(val))
             } else {
                 let val = default_value.parse::<i8>().map_err(|_| "Invalid i8 value")?;
@@ -99,7 +103,7 @@ fn parse_default_value(node_id: u8, data_type: DataType, default_value: &str) ->
         }
         DataType::Integer16 => {
             if default_value.contains("0x") {
-                let val = i16::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid i16 value")?;
+                let val = u16::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid i16 value")? as i16;
                 Ok(DataValue::Integer16(val))
             } else {
                 let val = default_value.parse::<i16>().map_err(|_| "Invalid i16 value")?;
@@ -108,7 +112,7 @@ fn parse_default_value(node_id: u8, data_type: DataType, default_value: &str) ->
         }
         DataType::Integer32 => {
             if default_value.contains("0x") {
-                let val = i32::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid i32 value")?;
+                let val = u32::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid i32 value")? as i32;
                 Ok(DataValue::Integer32(val))
             } else {
                 let val = default_value.parse::<i32>().map_err(|_| "Invalid i32 value")?;
@@ -116,7 +120,10 @@ fn parse_default_value(node_id: u8, data_type: DataType, default_value: &str) ->
             }
         }
         DataType::Unsigned8 => {
-            if default_value.contains("0x") {
+            if default_value.contains("$NODEID") {
+                let val = u8::from_str_radix(default_value.trim_start_matches("$NODEID+0x"), 16).map_err(|_| "Invalid u8 value")? | node_id;
+                Ok(DataValue::Unsigned8(val))
+            } else if default_value.contains("0x") {
                 let val = u8::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid u8 value")?;
                 Ok(DataValue::Unsigned8(val))
             } else {
@@ -138,7 +145,7 @@ fn parse_default_value(node_id: u8, data_type: DataType, default_value: &str) ->
         }
         DataType::Unsigned32 => {
             if default_value.contains("$NODEID") {
-                let val = (u16::from_str_radix(default_value.trim_start_matches("$NODEID+0x"), 16).map_err(|_| "Invalid u32 value")? | node_id as u16) as u32;
+                let val = u32::from_str_radix(default_value.trim_start_matches("$NODEID+0x"), 16).map_err(|_| "Invalid u32 value")? | node_id as u32;
                 Ok(DataValue::Unsigned32(val))
             }else if default_value.contains("0x") {
                     let val = u32::from_str_radix(default_value.trim_start_matches("0x"), 16).map_err(|_| "Invalid u32 value")?;
@@ -202,7 +209,8 @@ pub fn parse_eds(node_id: &u8, eds_file: &String) -> Result<EDSData, Box<dyn std
             let var = Var {
                 parameter_name,
                 access_type: ini.section(Some(section)).unwrap().get("AccessType").unwrap_or_default().to_string(),
-                value: parse_default_value(*node_id, data_type.clone(), default_value.clone().as_str()).unwrap(),
+                value: parse_default_value(*node_id, data_type.clone(), default_value.clone().as_str())
+                    .map_err(|e| format!("Section [{}]: {}", section, e))?,
                 pdo_mapping: parse_str_to_bool(ini.section(Some(section)).unwrap().get("PDOMapping").unwrap_or_default()),
             };
 

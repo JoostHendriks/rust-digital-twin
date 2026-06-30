@@ -1,0 +1,11 @@
+[Bus]
+interface = "vcan0" # Can bus interface name. Use "can0" for real machine and "vcan0" for virtual machine.
+baud_rate = 1000000
+
+[[Node]]
+    node_id = 1
+    eds_file = "CPB3-1-2.eds"
+
+[[Node]]
+    node_id = 2
+    eds_file = "CPB3-1-2.eds"

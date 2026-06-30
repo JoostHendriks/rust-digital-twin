@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
 use can_socket::{tokio::CanSocket, CanId};
@@ -8,12 +8,18 @@ use canopen_tokio::nmt::{NmtCommand, NmtState};
 use crate::eds::{DataValue, EDSData};
 use crate::cia402_runner::{Command, HomeStatus, ModeOfOperation, ProfilePositionStatus, ProfileVelocityStatus, State};
 
+/// Period at which the controller is updated when no CAN frame has arrived.
+const CONTROL_LOOP_PERIOD: Duration = Duration::from_millis(1);
+
 pub struct Node {
     pub node_id: u8,
     pub eds_data: EDSData,
     pub nmt_state: NmtState,
     pub socket: CanSocket,
     pub motor_controller: MotorController,
+    /// Counts SYNC messages seen since the last transmission, per TPDO, for
+    /// transmission types 1..=240 ("transmit every Nth SYNC").
+    tpdo_sync_counters: [u8; 8],
 }
 
 #[derive(Default)]
@@ -101,46 +107,55 @@ impl Node {
             eds_data,
             nmt_state: NmtState::Initializing,
             socket,
-            motor_controller: Default::default()
+            motor_controller: Default::default(),
+            tpdo_sync_counters: [0; 8],
         };
         node.motor_controller.control_oms1 = VecDeque::from(vec![false; 2]);
         Ok(node)
     }
 
-    pub async fn start_socket(&mut self) {
+    pub async fn run(&mut self) {
+        let mut tick = tokio::time::interval(CONTROL_LOOP_PERIOD);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            let frame = match self.socket.recv().await {
-                Ok(f) => f,
-                Err(e) => {
-                    log::error!("Error receiving frame: {}", e);
-                    continue;
-                }
-            };
-
-            let cob_id = frame.id().as_u32();
-            let node_id = (cob_id & 0x7F) as u8;
-            let function_code = frame.id().as_u32() & (0x0F << 7);
-
-            if node_id == 0 {
-                match function_code {
-                    0x000 => self.parse_nmt_command(&frame.data()).await,
-                    0x080 => self.parse_sync().await,
-                    _ => {},
-                }
-            } else if node_id == self.node_id {
-                match function_code {
-                    0x080 => self.parse_emcy().await,
-                    0x200 => self.parse_rpdo(&1, &frame.data()).await,
-                    0x300 => self.parse_rpdo(&2, &frame.data()).await,
-                    0x400 => self.parse_rpdo(&3, &frame.data()).await,
-                    0x500 => self.parse_rpdo(&4, &frame.data()).await,
-                    0x600 => self.parse_sdo_client_request(&frame.data()).await,
-                    _ => {},
-                }
+            tokio::select! {
+                frame = self.socket.recv() => self.handle_frame(frame).await,
+                _ = tick.tick() => {},
             }
 
-            if cob_id == 0x080 {
-                self.update_controller().await;
+            self.update_controller().await;
+        }
+    }
+
+    async fn handle_frame(&mut self, frame: std::io::Result<CanFrame>) {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("Error receiving frame: {}", e);
+                return;
+            }
+        };
+
+        let cob_id = frame.id().as_u32();
+        let node_id = (cob_id & 0x7F) as u8;
+        let function_code = frame.id().as_u32() & (0x0F << 7);
+
+        if node_id == 0 {
+            match function_code {
+                0x000 => self.parse_nmt_command(&frame.data()).await,
+                0x080 => self.parse_sync().await,
+                _ => {},
+            }
+        } else if node_id == self.node_id {
+            match function_code {
+                0x080 => self.parse_emcy().await,
+                0x200 => self.parse_rpdo(&1, &frame.data()).await,
+                0x300 => self.parse_rpdo(&2, &frame.data()).await,
+                0x400 => self.parse_rpdo(&3, &frame.data()).await,
+                0x500 => self.parse_rpdo(&4, &frame.data()).await,
+                0x600 => self.parse_sdo_client_request(&frame.data()).await,
+                _ => {},
             }
         }
     }
@@ -297,7 +312,7 @@ impl Node {
             .collect()
     }
 
-    async fn parse_sync(&self) {
+    async fn parse_sync(&mut self) {
         for tpdo_idx in 0..8u16 {
             if !self.tpdo_is_sync_active(tpdo_idx) {
                 continue;
@@ -307,7 +322,13 @@ impl Node {
         }
     }
 
-    fn tpdo_is_sync_active(&self, tpdo_idx: u16) -> bool {
+    /// Per CiA 301, TPDO transmission type (sub 2 of 0x1800 + idx) determines
+    /// whether/when a TPDO is sent on SYNC:
+    /// - 1..=240: synchronous cyclic, transmit every Nth SYNC (N = the type value).
+    /// - 254..=255: event-driven; not SYNC-triggered per spec, but treated here
+    ///   as "transmit on every SYNC" to match this simulator's existing convention.
+    /// - anything else (0, 252, 253): not triggered by SYNC.
+    fn tpdo_is_sync_active(&mut self, tpdo_idx: u16) -> bool {
         let vars = match self.eds_data.od.get(&(0x1800 + tpdo_idx)) {
             Some(v) => v,
             None => return false,
@@ -322,7 +343,24 @@ impl Node {
             .and_then(|v| if let DataValue::Unsigned8(val) = v.value { Some(val) } else { None })
             .unwrap_or(0);
 
-        enabled && sync_type == 255
+        if !enabled {
+            return false;
+        }
+
+        match sync_type {
+            1..=240 => {
+                let counter = &mut self.tpdo_sync_counters[tpdo_idx as usize];
+                *counter += 1;
+                if *counter >= sync_type {
+                    *counter = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            254 | 255 => true,
+            _ => false,
+        }
     }
 
     fn build_tpdo_payload(&self, tpdo_idx: u16) -> Vec<u8> {
