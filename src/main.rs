@@ -1,8 +1,6 @@
 use can_socket::tokio::CanSocket;
 use std::path::PathBuf;
 use tokio::task;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use futures::future;
 
 mod eds;
@@ -54,24 +52,24 @@ async fn do_main(options: Options) -> Result<(), ()> {
         log::info!("CAN bus on interface {} opened for node {}", &config.bus.interface, node.node_id);
 
         // Parse eds data
-        let node_data = eds::parse_eds(&node.node_id, &node.eds_file).unwrap();
+        let node_data = eds::parse_eds(&node.node_id, &node.eds_file).map_err(|e| {
+            log::error!("Failed to parse EDS file {} for node {}: {e}", node.eds_file, node.node_id)
+        })?;
 
         // Initialize controller
-        let node= Arc::new(Mutex::new(
-            Node::initialize(socket, node.node_id, node_data).await.unwrap()
-        ));
+        let node = Node::initialize(socket, node.node_id, node_data).await.map_err(|_| {
+            log::error!("Failed to initialize node {}", node.node_id)
+        })?;
         nodes.push(node);
     }
 
     let mut futures = Vec::new();
 
     // Start nodes
-    for node in nodes.iter() {
-        let node_clone: Arc<Mutex<Node>>  = Arc::clone(node);
+    for mut node in nodes.into_iter() {
         futures.push(
             task::spawn(async move {
-            let mut node = node_clone.lock().await;
-            node.start_socket().await;
+                node.start_socket().await;
             })
         );
     }
