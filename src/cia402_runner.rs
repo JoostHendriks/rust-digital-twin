@@ -53,8 +53,10 @@ pub enum ProfilePositionStatus {
 #[derive(Default, Debug)]
 pub enum ProfileVelocityStatus {
     #[default]
-    WaitingForStart,
-    Moving,
+    AxisSpeedZero,
+    TargetSpeedNotReached,
+    TargetSpeedReached,
+    AxisBraking,
 }
 
 /// Homing status
@@ -108,31 +110,21 @@ impl Node {
         match (&self.motor_controller.mode_of_operation, &self.motor_controller.state) {
 
             (ModeOfOperation::ProfilePosition, State::OperationEnabled) => {
-
+                self.motor_controller.status_oms1 = self.motor_controller.control_oms1[1];
                 match &self.motor_controller.profile_position_status {
-
                     ProfilePositionStatus::SetpointAcknownlegde => {
-
-                        self.motor_controller.status_oms1 = true;
-                        self.motor_controller.target_reached = true;
-
                         if self.motor_controller.control_oms1[0] && !self.motor_controller.control_oms1[1] {
-
+                            self.motor_controller.target_reached = false;
                             self.motor_controller.timer = Some(Instant::now());
-                            self.motor_controller.profile_position_status = ProfilePositionStatus::Moving
-
+                            self.motor_controller.profile_position_status = ProfilePositionStatus::Moving;
+                        } else {
+                            self.motor_controller.target_reached = true;
                         }
                     }
-
                     ProfilePositionStatus::Moving => {
-
-                        self.motor_controller.status_oms1 = false;
-                        self.motor_controller.target_reached = false;
-
                         if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
-                            self.motor_controller.profile_position_status = ProfilePositionStatus::SetpointAcknownlegde
+                            self.motor_controller.profile_position_status = ProfilePositionStatus::SetpointAcknownlegde;
                         }
-
                     }
 
                 }
@@ -140,65 +132,57 @@ impl Node {
             }
 
             (ModeOfOperation::ProfileVelocity, State::OperationEnabled) => {
-
                 match &self.motor_controller.profile_velocity_status {
-
-                    ProfileVelocityStatus::WaitingForStart => {
-
-                        self.motor_controller.target_reached = false;
-
-                        if !&self.motor_controller.halt {
-
-                            self.motor_controller.timer = Some(Instant::now());
-                            self.motor_controller.profile_velocity_status = ProfileVelocityStatus::Moving
-
-                        }
-                    }
-
-                    ProfileVelocityStatus::Moving => {
-
+                    ProfileVelocityStatus::AxisSpeedZero => {
                         self.motor_controller.target_reached = true;
-
-                        if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
-                            self.motor_controller.profile_velocity_status = ProfileVelocityStatus::WaitingForStart
+                        if !self.motor_controller.halt {
+                            self.motor_controller.timer = Some(Instant::now());
+                            self.motor_controller.profile_velocity_status = ProfileVelocityStatus::TargetSpeedNotReached
                         }
-
                     }
-
+                    ProfileVelocityStatus::TargetSpeedNotReached => {
+                        self.motor_controller.target_reached = false;
+                        if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
+                            self.motor_controller.profile_velocity_status = ProfileVelocityStatus::TargetSpeedReached
+                        }
+                    }
+                    ProfileVelocityStatus::TargetSpeedReached => {
+                        self.motor_controller.target_reached = true;
+                        if self.motor_controller.halt {
+                            self.motor_controller.timer = Some(Instant::now());
+                            self.motor_controller.profile_velocity_status = ProfileVelocityStatus::AxisBraking
+                        }
+                    }
+                    ProfileVelocityStatus::AxisBraking => {
+                        self.motor_controller.target_reached = false;
+                        if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
+                            self.motor_controller.profile_velocity_status = ProfileVelocityStatus::AxisSpeedZero
+                        }
+                    }
                 }
-
             }
 
             (ModeOfOperation::Homing, State::OperationEnabled) => {
-
                 match &self.motor_controller.home_status {
-
                     HomeStatus::WaitingForStart => {
-
                         self.motor_controller.target_reached = true;
                         self.motor_controller.status_oms2 = false;
-
                         if self.motor_controller.control_oms1[0] && !self.motor_controller.control_oms1[1] {
                             self.motor_controller.timer = Some(Instant::now());
                             self.motor_controller.home_status = HomeStatus::Homing
                         }
                     }
                     HomeStatus::Homing => {
-
                         self.motor_controller.target_reached = false;
                         self.motor_controller.status_oms1 = false;
                         self.motor_controller.status_oms2 = false;
-
                         if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
-
                             self.motor_controller.target_reached = true;
                             self.motor_controller.status_oms1 = true;
                             self.motor_controller.status_oms2 = false;
-
                             self.motor_controller.home_status = HomeStatus::WaitingForStart
                         }
                     }
-
                 }
             }
 
