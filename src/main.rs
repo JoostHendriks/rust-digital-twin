@@ -69,7 +69,7 @@ async fn do_main(options: Options) -> Result<(), ()> {
     for mut node in nodes.into_iter() {
         futures.push(
             task::spawn(async move {
-                node.start_socket().await;
+                node.run().await;
             })
         );
     }

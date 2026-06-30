@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
 use can_socket::{tokio::CanSocket, CanId};
@@ -7,6 +7,9 @@ use canopen_tokio::nmt::{NmtCommand, NmtState};
 
 use crate::eds::{DataValue, EDSData};
 use crate::cia402_runner::{Command, HomeStatus, ModeOfOperation, ProfilePositionStatus, ProfileVelocityStatus, State};
+
+/// Period at which the controller is updated when no CAN frame has arrived.
+const CONTROL_LOOP_PERIOD: Duration = Duration::from_millis(1);
 
 pub struct Node {
     pub node_id: u8,
@@ -107,40 +110,48 @@ impl Node {
         Ok(node)
     }
 
-    pub async fn start_socket(&mut self) {
+    pub async fn run(&mut self) {
+        let mut tick = tokio::time::interval(CONTROL_LOOP_PERIOD);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            let frame = match self.socket.recv().await {
-                Ok(f) => f,
-                Err(e) => {
-                    log::error!("Error receiving frame: {}", e);
-                    continue;
-                }
-            };
-
-            let cob_id = frame.id().as_u32();
-            let node_id = (cob_id & 0x7F) as u8;
-            let function_code = frame.id().as_u32() & (0x0F << 7);
-
-            if node_id == 0 {
-                match function_code {
-                    0x000 => self.parse_nmt_command(&frame.data()).await,
-                    0x080 => self.parse_sync().await,
-                    _ => {},
-                }
-            } else if node_id == self.node_id {
-                match function_code {
-                    0x080 => self.parse_emcy().await,
-                    0x200 => self.parse_rpdo(&1, &frame.data()).await,
-                    0x300 => self.parse_rpdo(&2, &frame.data()).await,
-                    0x400 => self.parse_rpdo(&3, &frame.data()).await,
-                    0x500 => self.parse_rpdo(&4, &frame.data()).await,
-                    0x600 => self.parse_sdo_client_request(&frame.data()).await,
-                    _ => {},
-                }
+            tokio::select! {
+                frame = self.socket.recv() => self.handle_frame(frame).await,
+                _ = tick.tick() => {},
             }
 
-            if cob_id == 0x080 {
-                self.update_controller().await;
+            self.update_controller().await;
+        }
+    }
+
+    async fn handle_frame(&mut self, frame: std::io::Result<CanFrame>) {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("Error receiving frame: {}", e);
+                return;
+            }
+        };
+
+        let cob_id = frame.id().as_u32();
+        let node_id = (cob_id & 0x7F) as u8;
+        let function_code = frame.id().as_u32() & (0x0F << 7);
+
+        if node_id == 0 {
+            match function_code {
+                0x000 => self.parse_nmt_command(&frame.data()).await,
+                0x080 => self.parse_sync().await,
+                _ => {},
+            }
+        } else if node_id == self.node_id {
+            match function_code {
+                0x080 => self.parse_emcy().await,
+                0x200 => self.parse_rpdo(&1, &frame.data()).await,
+                0x300 => self.parse_rpdo(&2, &frame.data()).await,
+                0x400 => self.parse_rpdo(&3, &frame.data()).await,
+                0x500 => self.parse_rpdo(&4, &frame.data()).await,
+                0x600 => self.parse_sdo_client_request(&frame.data()).await,
+                _ => {},
             }
         }
     }
