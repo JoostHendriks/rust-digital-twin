@@ -17,6 +17,9 @@ pub struct Node {
     pub nmt_state: NmtState,
     pub socket: CanSocket,
     pub motor_controller: MotorController,
+    /// Counts SYNC messages seen since the last transmission, per TPDO, for
+    /// transmission types 1..=240 ("transmit every Nth SYNC").
+    tpdo_sync_counters: [u8; 8],
 }
 
 #[derive(Default)]
@@ -104,7 +107,8 @@ impl Node {
             eds_data,
             nmt_state: NmtState::Initializing,
             socket,
-            motor_controller: Default::default()
+            motor_controller: Default::default(),
+            tpdo_sync_counters: [0; 8],
         };
         node.motor_controller.control_oms1 = VecDeque::from(vec![false; 2]);
         Ok(node)
@@ -308,7 +312,7 @@ impl Node {
             .collect()
     }
 
-    async fn parse_sync(&self) {
+    async fn parse_sync(&mut self) {
         for tpdo_idx in 0..8u16 {
             if !self.tpdo_is_sync_active(tpdo_idx) {
                 continue;
@@ -318,7 +322,13 @@ impl Node {
         }
     }
 
-    fn tpdo_is_sync_active(&self, tpdo_idx: u16) -> bool {
+    /// Per CiA 301, TPDO transmission type (sub 2 of 0x1800 + idx) determines
+    /// whether/when a TPDO is sent on SYNC:
+    /// - 1..=240: synchronous cyclic, transmit every Nth SYNC (N = the type value).
+    /// - 254..=255: event-driven; not SYNC-triggered per spec, but treated here
+    ///   as "transmit on every SYNC" to match this simulator's existing convention.
+    /// - anything else (0, 252, 253): not triggered by SYNC.
+    fn tpdo_is_sync_active(&mut self, tpdo_idx: u16) -> bool {
         let vars = match self.eds_data.od.get(&(0x1800 + tpdo_idx)) {
             Some(v) => v,
             None => return false,
@@ -333,7 +343,24 @@ impl Node {
             .and_then(|v| if let DataValue::Unsigned8(val) = v.value { Some(val) } else { None })
             .unwrap_or(0);
 
-        enabled && sync_type == 255
+        if !enabled {
+            return false;
+        }
+
+        match sync_type {
+            1..=240 => {
+                let counter = &mut self.tpdo_sync_counters[tpdo_idx as usize];
+                *counter += 1;
+                if *counter >= sync_type {
+                    *counter = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            254 | 255 => true,
+            _ => false,
+        }
     }
 
     fn build_tpdo_payload(&self, tpdo_idx: u16) -> Vec<u8> {
