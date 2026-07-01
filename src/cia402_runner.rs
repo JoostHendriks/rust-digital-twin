@@ -81,6 +81,96 @@ impl ModeOfOperation {
 
 impl Node {
 
+    /// Compute expected travel time for a trapezoidal (or triangular) velocity
+    /// profile using the standard CIA 402 OD objects:
+    ///   0x6064 – position actual value (Integer32)
+    ///   0x607A – target position      (Integer32)
+    ///   0x6081 – profile velocity     (Unsigned32, units/s)
+    ///   0x6083 – profile acceleration (Unsigned32, units/s²)
+    ///   0x6084 – profile deceleration (Unsigned32, units/s²)
+    fn compute_movement_duration(&self) -> Duration {
+        let get_i32 = |index: u16| -> Option<f64> {
+            self.eds_data.od.get(&index)?.get(&0).and_then(|v| {
+                if let DataValue::Integer32(x) = v.value { Some(x as f64) } else { None }
+            })
+        };
+        let get_u32 = |index: u16| -> Option<f64> {
+            self.eds_data.od.get(&index)?.get(&0).and_then(|v| {
+                if let DataValue::Unsigned32(x) = v.value { Some(x as f64) } else { None }
+            })
+        };
+
+        let actual = get_i32(0x6064).unwrap_or(0.0);
+        let target = get_i32(0x607A).unwrap_or(0.0);
+        let vel    = get_u32(0x6081).unwrap_or(0.0);
+        let acc    = get_u32(0x6083).unwrap_or(0.0);
+        let dec    = get_u32(0x6084).unwrap_or(0.0);
+
+        let delta = (target - actual).abs();
+
+        if delta == 0.0 || vel <= 0.0 || acc <= 0.0 || dec <= 0.0 {
+            return Duration::ZERO;
+        }
+
+        let d_acc = vel * vel / (2.0 * acc);
+        let d_dec = vel * vel / (2.0 * dec);
+
+        let secs = if d_acc + d_dec <= delta {
+            // Trapezoidal profile: reaches full profile velocity
+            vel / acc + (delta - d_acc - d_dec) / vel + vel / dec
+        } else {
+            // Triangular profile: peak velocity is lower than profile velocity
+            let v_peak = (2.0 * delta * acc * dec / (acc + dec)).sqrt();
+            v_peak / acc + v_peak / dec
+        };
+
+        Duration::from_secs_f64(secs / self.time_scale)
+    }
+
+    fn compute_acceleration_duration(&self) -> Duration {
+        let get_i32 = |index: u16| -> Option<f64> {
+            self.eds_data.od.get(&index)?.get(&0).and_then(|v| {
+                if let DataValue::Integer32(x) = v.value { Some(x as f64) } else { None }
+            })
+        };
+        let get_u32 = |index: u16| -> Option<f64> {
+            self.eds_data.od.get(&index)?.get(&0).and_then(|v| {
+                if let DataValue::Unsigned32(x) = v.value { Some(x as f64) } else { None }
+            })
+        };
+
+        let vel = get_i32(0x60FF).unwrap_or(0.0).abs();
+        let acc = get_u32(0x6083).unwrap_or(0.0);
+
+        if vel <= 0.0 || acc <= 0.0 {
+            return Duration::ZERO;
+        }
+
+        Duration::from_secs_f64(vel / acc / self.time_scale)
+    }
+
+    fn compute_deceleration_duration(&self) -> Duration {
+        let get_i32 = |index: u16| -> Option<f64> {
+            self.eds_data.od.get(&index)?.get(&0).and_then(|v| {
+                if let DataValue::Integer32(x) = v.value { Some(x as f64) } else { None }
+            })
+        };
+        let get_u32 = |index: u16| -> Option<f64> {
+            self.eds_data.od.get(&index)?.get(&0).and_then(|v| {
+                if let DataValue::Unsigned32(x) = v.value { Some(x as f64) } else { None }
+            })
+        };
+
+        let vel = get_i32(0x60FF).unwrap_or(0.0).abs();
+        let dec = get_u32(0x6084).unwrap_or(0.0);
+
+        if vel <= 0.0 || dec <= 0.0 {
+            return Duration::ZERO;
+        }
+
+        Duration::from_secs_f64(vel / dec / self.time_scale)
+    }
+
     pub async fn update_controller(&mut self) {
 
         if let Some(var) = self.eds_data.od.get(&0x6060)
@@ -116,13 +206,16 @@ impl Node {
                         if self.motor_controller.control_oms1[0] && !self.motor_controller.control_oms1[1] {
                             self.motor_controller.target_reached = false;
                             self.motor_controller.timer = Some(Instant::now());
+                            self.motor_controller.movement_duration = Some(self.compute_movement_duration());
                             self.motor_controller.profile_position_status = ProfilePositionStatus::Moving;
                         } else {
                             self.motor_controller.target_reached = true;
                         }
                     }
                     ProfilePositionStatus::Moving => {
-                        if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
+                        let elapsed = self.motor_controller.timer.unwrap().elapsed();
+                        let duration = self.motor_controller.movement_duration.unwrap_or(Duration::ZERO);
+                        if elapsed >= duration {
                             self.motor_controller.profile_position_status = ProfilePositionStatus::SetpointAcknownlegde;
                         }
                     }
@@ -137,12 +230,15 @@ impl Node {
                         self.motor_controller.target_reached = true;
                         if !self.motor_controller.halt {
                             self.motor_controller.timer = Some(Instant::now());
+                            self.motor_controller.movement_duration = Some(self.compute_acceleration_duration());
                             self.motor_controller.profile_velocity_status = ProfileVelocityStatus::TargetSpeedNotReached
                         }
                     }
                     ProfileVelocityStatus::TargetSpeedNotReached => {
                         self.motor_controller.target_reached = false;
-                        if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
+                        let elapsed = self.motor_controller.timer.unwrap().elapsed();
+                        let duration = self.motor_controller.movement_duration.unwrap_or(Duration::ZERO);
+                        if elapsed >= duration {
                             self.motor_controller.profile_velocity_status = ProfileVelocityStatus::TargetSpeedReached
                         }
                     }
@@ -150,12 +246,15 @@ impl Node {
                         self.motor_controller.target_reached = true;
                         if self.motor_controller.halt {
                             self.motor_controller.timer = Some(Instant::now());
+                            self.motor_controller.movement_duration = Some(self.compute_deceleration_duration());
                             self.motor_controller.profile_velocity_status = ProfileVelocityStatus::AxisBraking
                         }
                     }
                     ProfileVelocityStatus::AxisBraking => {
                         self.motor_controller.target_reached = false;
-                        if self.motor_controller.timer.unwrap().elapsed() > Duration::from_millis(100) {
+                        let elapsed = self.motor_controller.timer.unwrap().elapsed();
+                        let duration = self.motor_controller.movement_duration.unwrap_or(Duration::ZERO);
+                        if elapsed >= duration {
                             self.motor_controller.profile_velocity_status = ProfileVelocityStatus::AxisSpeedZero
                         }
                     }

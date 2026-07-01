@@ -57,7 +57,7 @@ async fn do_main(options: Options) -> Result<(), ()> {
         })?;
 
         // Initialize controller
-        let node = Node::initialize(socket, node.node_id, node_data).await.map_err(|_| {
+        let node = Node::initialize(socket, node.node_id, node_data, config.time_scale).await.map_err(|_| {
             log::error!("Failed to initialize node {}", node.node_id)
         })?;
         nodes.push(node);
