@@ -11,7 +11,16 @@ pub struct Config {
     /// Configuration of the nodes.
     pub node: Vec<Node>,
 
+    /// Factor by which simulated motion time is divided. Values above 1.0
+    /// speed up motion (e.g. 10.0 makes a 5 s move finish in 0.5 s). Useful
+    /// for testing without waiting for real motion durations.
+    /// Must appear before any section headers (i.e. at the very top of the TOML file).
+    #[serde(rename = "time_scale", default = "default_time_scale")]
+    pub time_scale: f64,
+
 }
+
+fn default_time_scale() -> f64 { 1.0 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

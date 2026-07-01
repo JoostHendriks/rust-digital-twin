@@ -17,6 +17,7 @@ pub struct Node {
     pub nmt_state: NmtState,
     pub socket: CanSocket,
     pub motor_controller: MotorController,
+    pub time_scale: f64,
     /// Counts SYNC messages seen since the last transmission, per TPDO, for
     /// transmission types 1..=240 ("transmit every Nth SYNC").
     tpdo_sync_counters: [u8; 8],
@@ -38,6 +39,7 @@ pub struct MotorController {
     pub status_oms1: bool,
     pub status_oms2: bool,
     pub timer: Option<Instant>,
+    pub movement_duration: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -101,6 +103,7 @@ impl Node {
         socket: CanSocket,
         node_id: u8,
         eds_data: EDSData,
+        time_scale: f64,
     ) -> Result<Self, ()> {
         let mut node = Self {
             node_id,
@@ -109,6 +112,7 @@ impl Node {
             socket,
             motor_controller: Default::default(),
             tpdo_sync_counters: [0; 8],
+            time_scale,
         };
         node.motor_controller.control_oms1 = VecDeque::from(vec![false; 2]);
         Ok(node)
